@@ -8,13 +8,7 @@ import triton.language as tl
 from src.utils import *
 from communication import *
 
-from src.flash_attn_triton import flash_attn_triton
 from src.utils import ref_attn
-try:
-    from flash_attn import flash_attn_func as flash_attn_func_official
-except ImportError:
-    flash_attn_func_official = None
-    
 
 # Prepare buffer for send and recv
 def prepare_kv_double_buffer(k, v):
