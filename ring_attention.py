@@ -42,6 +42,7 @@ def test_p2p_ring_pipeline():
     full_v = v.clone()
 
     a, b, c, d = q.size()
+    # NOTE: global data to simulate DDP
     real_q = q[:,:, rank * seq_per_rank: (rank + 1) * seq_per_rank, :].view(a, b, -1, d).contiguous().clone().detach().requires_grad_(True)
     real_k = k[:,:, rank * seq_per_rank: (rank + 1) * seq_per_rank, :].view(a, b, -1, d).contiguous().clone().detach().requires_grad_(True)
     real_v = v[:,:, rank * seq_per_rank: (rank + 1) * seq_per_rank, :].view(a, b, -1, d).contiguous().clone().detach().requires_grad_(True)
@@ -87,28 +88,26 @@ def test_p2p_ring_pipeline():
 def _fwd_kernel(
     Q, K, V, sm_scale,
     L, O,
-    # NOTE: 开始时rank 0 got qkv 0
     MAX, DENOM,
     stride_q_bs, stride_q_head, stride_q_seqlen, stride_q_dim,
     stride_k_bs, stride_k_head, stride_k_seqlen, stride_k_dim,
     stride_v_bs, stride_v_head, stride_v_seqlen, stride_v_dim,
-    # TODO: 其他stride这里是不需要的, 因为q, k, v, o的形状一样
     BS, HEAD, SEQLEN,
     DIM: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
-    # BLOCK_M用于做Q的分块
+    # BLOCK_M for Q block
     BLOCK_M: tl.constexpr,
-    # BLOCK_N用于做K和V的分块
+    # BLOCK_N for K,V block
     BLOCK_N: tl.constexpr,
 ):
     # grid = (cdiv(seqlen, BLOCK_M), bs * head)
     # triton.language.program_id(axis) axis is The axis of the 3D launch grid
-    # Q分块的起始地址
+    # start of Q block
     start_m = tl.program_id(0)
-    # NOTE: 计算chunk内偏移
+    # NOTE: compute offset within each chunk
     # start_m % SEQLEN
     # start_m = start_m % SEQLEN
-    # 跳过(bs, head)的偏移
+    # offset of (bs, head)
     off_bs_head = tl.program_id(1)
 
     qkv_base_offset = off_bs_head * stride_q_head
@@ -127,14 +126,14 @@ def _fwd_kernel(
         # base offset to skip to the right (bs, head)
         base=K + qkv_base_offset,
         # the shape of parent
-        # NOTE: make_block_ptr读入时将K转置了
+        # NOTE: transpose K when loading
         shape=(DIM, SEQLEN),
         strides=(stride_k_dim, stride_k_seqlen),
-        # 每个Q需要遍历整个的k和v
+        # iter over all K V each Q
         offsets=(0, 0),
-        # K根据BLOCK_N分块
+        # BLOCK_N for K, V block
         block_shape=(DIM, BLOCK_N),
-        # 读入K的转置
+        # transpose loading
         order=(0, 1),
     )
     V_block_ptr = tl.make_block_ptr(
@@ -143,25 +142,22 @@ def _fwd_kernel(
         # the shape of parent
         shape=(SEQLEN, DIM),
         strides=(stride_k_seqlen, stride_v_dim),
-        # 每个Q需要遍历整个的k和v
         offsets=(0, 0),
-        # K根据BLOCK_N分块
         block_shape=(BLOCK_N, DIM),
         order=(1, 0),
     )
     # initialize offsets
-    # NOTE: BLOCK_M表示Q的分块大小, BLOCK_N表示k, v的分块大小
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
 
-    # NOTE: 一次处理一个(BLOCK_M, dim)的q, 而max和分母的sum都只需要一维, 即(BLOCK_M, 1)
+    # get a block (BLOCK_M, 1) of max and denom
     max_ptr = MAX + off_bs_head * SEQLEN + offs_m
     max = tl.load(max_ptr)
-    # 分母累加的sum, 每行的sum是一样的, 所以只需要一维然后广播即可
+    # the sum of denominator, each row has the same sum, so we only need one dimension and broadcast
     denom_ptr = DENOM + off_bs_head * SEQLEN + offs_m
     denom = tl.load(denom_ptr)
 
-    # out_buffer从外界反复读入
+    # out_buffer need to read from outside of kernel
     O_block_ptr = tl.make_block_ptr(
         base=O + qkv_base_offset,
         shape=(SEQLEN, DIM),
@@ -180,7 +176,6 @@ def _fwd_kernel(
     q = (q * qk_scale).to(tl.float16)
     # loop over k, v and update accumulator
     lo = 0
-    # NOTE:: CAUSAL就是常说的不能看到后面的文本的自回归模型
     hi = (start_m + 1) * BLOCK_M if IS_CAUSAL else SEQLEN
 
     for start_n in range(lo, hi, BLOCK_N):
@@ -192,7 +187,6 @@ def _fwd_kernel(
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         if IS_CAUSAL:
             qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
-        # NOTE: 执行矩阵乘法(matrix product), k在make_block_ptr时已经转置
         # qk init as zero
         qk += tl.dot(q, k)
 
@@ -204,27 +198,23 @@ def _fwd_kernel(
         # tl.max(block, axis)
         # tl.maximum(block, block)
         max_new = tl.maximum(max, tl.max(qk, 1))
-        # 保存exp的值, 节省exp操作
         alpha = tl.math.exp2(max - max_new)
         # NOTE:
         # nume = e^{x - max(x)}
-        # max.shape = [BLOCK_M], max_new[:, None]扩展成[BLOCK_M, 1]来做广播操作
+        # max.shape = [BLOCK_M], max_new[:, None] extend to [BLOCK_M, 1] to broadcast
         nume = tl.math.exp2(qk - max_new[:, None])
         # scale and update acc 
-        # NOTE: 利用广播来快速构建scale用于更新分母
+        # NOTE: broadcast to rescale denom
         out_scale = denom * 0 + alpha
         # NOTE: 
         # out_scale.shape = l_i.shape = [BLOCK_M]
-        # out_scale[:, None]扩展成[BLOCK_M, 1]来做广播操作
-        # out_buffer = old_out * scale来更新分子
+        # out_buffer = old_out * scale to rescale
         out_buffer *= out_scale[:, None]
         out_buffer += tl.dot(nume.to(tl.float16), v)
         # update max and denominator
         denom = denom * alpha + tl.sum(nume, 1)
         max = max_new
         # update k v pointer
-        # NOTE: 计算下一个k, v的分块
-        # 因为k已经转置(dim, seqlen), 所以算下一批seq的k时是增加k的第二个维度
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
 
@@ -237,37 +227,26 @@ def _fwd_kernel(
 @triton.jit
 def _rescale(
     L, O,
-    # NOTE: 开始时rank 0 got qkv 0
     DENOM,
     stride_o_bs, stride_o_head, stride_o_seqlen, stride_o_dim,
     BS, HEAD, SEQLEN,
     DIM: tl.constexpr,
-    # BLOCK_M用于做Q的分块
     BLOCK_M: tl.constexpr,
-    # BLOCK_N用于做K和V的分块
     BLOCK_N: tl.constexpr,
 ):
     # grid = (cdiv(seqlen, BLOCK_M), bs * head)
     # triton.language.program_id(axis) axis is The axis of the 3D launch grid
-    # Q分块的起始地址
     start_m = tl.program_id(0)
-    # NOTE: 计算chunk内偏移
-    # start_m % SEQLEN
-    # start_m = start_m % SEQLEN
-    # 跳过(bs, head)的偏移
     off_bs_head = tl.program_id(1)
 
     qkv_base_offset = off_bs_head * stride_o_head
     # initialize offsets
-    # NOTE: BLOCK_M表示Q的分块大小, BLOCK_N表示k, v的分块大小
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
 
-    # 分母累加的sum, 每行的sum是一样的, 所以只需要一维然后广播即可
     denom_ptr = DENOM + off_bs_head * SEQLEN + offs_m
     denom = tl.load(denom_ptr)
 
-    # out_buffer需要加载外部的out_buffer有部分数据的out_buffer
     O_block_ptr = tl.make_block_ptr(
         base=O + qkv_base_offset,
         shape=(SEQLEN, DIM),
@@ -279,12 +258,11 @@ def _rescale(
     out_buffer = tl.load(O_block_ptr)
     out_buffer = out_buffer.to(tl.float16)
 
-    # TODO: 整理并处理精度转换问题, 不用转来转去的
     out_buffer = out_buffer / denom[:, None]
     tl.store(O_block_ptr, out_buffer.to(tl.float16))
 
-# TODO: 目前没有block wise, 直接combin
-# NOTE: 一slice q只能产出一slice的o 和 L!
+# TODO: withou block wise for now, combin directly
+# NOTE: a slice of Q generate a slice of O and L
 def ring_attention(q, k, v, causal=True, sm_scale=1):
 
     rank = dist.get_rank()
@@ -296,7 +274,7 @@ def ring_attention(q, k, v, causal=True, sm_scale=1):
     assert Lq == Lk and Lk == Lv
     assert Lk in {16, 32, 64, 128}
 
-    # 创建发送和接收的buffer
+    # create send buffer and recv buffer with double buffering
     buffer_k, buffer_v = prepare_kv_double_buffer(k, v)
 
     max = torch.full((bs, head, seqlen), fill_value=-float("inf"), device=q.device, dtype=torch.float32).contiguous()
@@ -311,9 +289,8 @@ def ring_attention(q, k, v, causal=True, sm_scale=1):
 
     # NOTE: 
     # L.shape = (bs * head, seqlen)
-    # L记录了所有的分母和mi(m_i + tl.math.log2(l_i)), 用于后续的backward
+    # TODO: L is used for backward
     L = torch.empty((q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
-    # 设置适当的wrap以提升性能
     num_warps = 4 if Lk <= 64 else 8
     for time_step in range(world_size):
         # send buffer
@@ -340,12 +317,9 @@ def ring_attention(q, k, v, causal=True, sm_scale=1):
             num_warps=num_warps,
             num_stages=4)
 
-        # TODO: 必须吗
-        # TODO: 但用户态调用sync 其实会很耗费时间?
+        # TODO: let it be user mode
         torch.cuda.synchronize()
         step_kv_send_recv(buffer_k[buf_id1], buffer_k[buf_id2], buffer_v[buf_id1], buffer_v[buf_id2])
-
-    # TODO: 多次kernel启动加上中间的多次类型转换会导致严重的精度丢失
 
     _rescale[grid](
             L, local_o,
@@ -357,7 +331,6 @@ def ring_attention(q, k, v, causal=True, sm_scale=1):
     torch.cuda.synchronize()
 
 
-    # TODO: 没有blockwise, 直接gather
     res_o = [torch.empty_like(q, dtype=local_o.dtype) for _ in range(world_size)]
     dist.all_gather(res_o, local_o)
     res_o = torch.cat(res_o, dim=-2)
@@ -382,6 +355,7 @@ def test_ring_attention():
     full_v = v.clone()
 
     a, b, c, d = q.size()
+    # NOTE: global data to simulate DDP
     real_q = q[:,:, rank * seq_per_rank: (rank + 1) * seq_per_rank, :].view(a, b, -1, d).contiguous().clone().detach().requires_grad_(True)
     real_k = k[:,:, rank * seq_per_rank: (rank + 1) * seq_per_rank, :].view(a, b, -1, d).contiguous().clone().detach().requires_grad_(True)
     real_v = v[:,:, rank * seq_per_rank: (rank + 1) * seq_per_rank, :].view(a, b, -1, d).contiguous().clone().detach().requires_grad_(True)
